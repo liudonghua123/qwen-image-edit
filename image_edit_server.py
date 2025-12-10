@@ -2,10 +2,12 @@ import base64
 import io
 import time
 import logging
+import secrets # <-- ADDED: For secure credential comparison
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, Form, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthCredentials
+# --- FIX: Changed from HTTPBearer/HTTPAuthCredentials to HTTPBasic/HTTPBasicCredentials ---
+from fastapi.security import HTTPBasic, HTTPBasicCredentials 
 from diffusers import QwenImageEditPipeline
 from PIL import Image
 import torch
@@ -26,7 +28,8 @@ model_loaded = False
 app = FastAPI(title="Qwen Image Edit API", version="1.0.0")
 
 # Security
-security = HTTPBearer(auto_error=False)  # auto_error=False to make authentication optional
+# --- FIX: Changed scheme to HTTPBasic ---
+security = HTTPBasic(auto_error=False)  # auto_error=False to make authentication optional
 
 # ----------------------------
 # Custom Exceptions
@@ -77,23 +80,33 @@ def pil_to_b64(image: Image.Image):
 # ----------------------------
 # Auth: Verify API Key
 # ----------------------------
-async def verify_api_key(credentials: HTTPAuthCredentials = Depends(security)):
-    """Verify Bearer token matches API key (optional if API_KEY is not set)"""
+# --- FIX: Changed dependency type hint to HTTPBasicCredentials ---
+async def verify_api_key(credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify Basic Auth password matches API key (optional if API_KEY is not set)"""
     # If authentication is not required, skip verification
     if not require_auth:
         return None
     
     # If authentication is required but no credentials provided
     if credentials is None:
-        logger.warning("API key required but not provided")
-        raise UnauthorizedError("API key is required")
+        logger.warning("Basic Auth credentials required but not provided")
+        raise UnauthorizedError("Credentials are required")
+    
+    # We treat the API_KEY as the expected password for simplicity.
+    # Use secrets.compare_digest for secure, timing-attack-resistant comparison.
+    is_correct_key = secrets.compare_digest(
+        credentials.password, 
+        api_key
+    )
     
     # Verify the API key matches
-    if credentials.credentials != api_key:
-        logger.warning(f"Unauthorized API key attempt: {credentials.credentials[:10]}...")
-        raise UnauthorizedError("Invalid API key")
+    if not is_correct_key:
+        logger.warning(f"Unauthorized Basic Auth attempt by username: {credentials.username}")
+        # Note: The unauthorized error will automatically prompt the client for credentials
+        raise UnauthorizedError("Invalid username or password")
     
-    return credentials.credentials
+    logger.info(f"Successful Basic Auth attempt by username: {credentials.username}")
+    return credentials.username
 
 # ----------------------------
 # Health Check Endpoints
@@ -136,15 +149,18 @@ async def image_edit(
     mask: UploadFile = None,
     size: str = Form("1024x1024"),
     n: int = Form(1),
-    credentials: HTTPAuthCredentials = Depends(security),
+    # --- FIX: Changed dependency type hint to HTTPBasicCredentials ---
+    credentials: HTTPBasicCredentials = Depends(security), 
 ):
     """
     Edit an image using Qwen Image Edit model.
     
     Authentication is optional (only required if API_KEY environment variable is set).
+    Uses HTTP Basic Auth (Username: any, Password: API_KEY).
     """
     try:
         # Verify authentication (if required)
+        # credentials will contain username and password if provided
         await verify_api_key(credentials)
         
         # Check model is ready
@@ -209,6 +225,7 @@ async def image_edit(
         
     except UnauthorizedError as e:
         logger.warning(f"Unauthorized request: {e.message}")
+        # When raising UnauthorizedError, FastAPI will automatically add the WWW-Authenticate: Basic header
         raise HTTPException(status_code=e.status_code, detail={"error": e.code, "message": e.message})
     except ModelNotReadyError as e:
         logger.error(f"Model not ready: {e.message}")
