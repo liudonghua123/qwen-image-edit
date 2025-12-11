@@ -6,7 +6,7 @@
 
 - ✅ **OpenAI 兼容 API**：`/v1/images/edits` 端点与 OpenAI 接口兼容
 - ✅ **健康检查端点**：支持 `/health` 和 `/ready` 用于容器编排
-- ✅ **可选 API 认证**：Bearer Token 身份验证（可选）
+- ✅ **可选 API 认证**：HTTP Basic Auth（可选，密码为 `API_KEY`）
 - ✅ **完善的错误处理**：标准化错误响应和详细日志
 - ✅ **结构化日志**：便于监控和调试
 - ✅ **GPU 加速**：支持 CUDA 加速推理
@@ -26,6 +26,16 @@ cp .env.example .env
 ```bash
 QWEN_MODEL_DIR=/path/to/qwen/models    # 模型目录路径
 API_KEY=your-secret-key                # API 密钥（可选，不设置则禁用认证）
+```
+
+你也可以设置 `DEVICE_MAP`（可选）：
+- `cuda`：将模型放在单个 CUDA 设备上（默认）
+- `balanced`：让库在可用设备间平衡模型层
+
+例如：
+
+```bash
+DEVICE_MAP=cuda
 ```
 
 **注意**：`API_KEY` 是可选的：
@@ -61,16 +71,28 @@ docker run --gpus all \
 
 ### 本地开发运行
 
-安装依赖：
+安装并本地开发运行：
+
+推荐使用 `pyproject.toml` 安装依赖并可选地以可编辑模式安装：
 
 ```bash
-pip install fastapi uvicorn diffusers transformers accelerate pillow python-multipart python-dotenv
+# 安装到当前环境（会使用 pyproject.toml 中的依赖声明）
+pip install .
+
+# 或者可编辑安装（便于开发）
+pip install -e .
 ```
 
-运行服务：
+注意：`torch` 可能需要与目标 CUDA 版本匹配的 wheel，视你的 GPU 环境而定；如果需要，请参考 PyTorch 官方安装命令以选择合适的 CUDA 轮子。
+
+运行服务（推荐使用 `main.py` 入口或直接用 `uvicorn`）：
 
 ```bash
-uvicorn image_edit_server:app --host 0.0.0.0 --port 8000
+# 使用 uvicorn 指向 main:app
+uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 或直接用 python
+python main.py
 ```
 
 ## API 文档
@@ -119,9 +141,19 @@ uvicorn image_edit_server:app --host 0.0.0.0 --port 8000
 
 使用文本提示编辑图像。
 
-**请求头**:
-```
-Authorization: Bearer your-api-key  # 仅当设置了 API_KEY 环境变量时需要
+**认证**:
+
+本项目使用 HTTP Basic Auth（当设置了 `API_KEY` 时启用）。用户名可以是任意字符串，密码必须是 `API_KEY` 的值。
+
+示例：使用 `curl` 提供 Basic Auth（用户名 `user`，密码为 `API_KEY`）
+
+```bash
+# 启用认证模式（使用 -u username:password）
+curl -X POST "http://localhost:8000/v1/images/edits" \
+  -u "user:your-secret-key" \
+  -F "prompt=a beautiful landscape" \
+  -F "image=@image.jpg" \
+  -F "n=1"
 ```
 
 **请求体** (multipart/form-data):
@@ -268,14 +300,14 @@ livenessProbe:
   httpGet:
     path: /health
     port: 8000
-  initialDelaySeconds: 40
+  initialDelaySeconds: 600
   periodSeconds: 30
 
 readinessProbe:
   httpGet:
     path: /ready
     port: 8000
-  initialDelaySeconds: 40
+  initialDelaySeconds: 600
   periodSeconds: 10
 ```
 

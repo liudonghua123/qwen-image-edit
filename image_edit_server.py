@@ -12,6 +12,7 @@ from diffusers import QwenImageEditPipeline
 from PIL import Image
 import torch
 import os
+from dotenv import load_dotenv
 
 # Setup logging
 logging.basicConfig(
@@ -20,10 +21,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Load environment variables from a .env file if present
+load_dotenv()
+
 model_dir = os.getenv("QWEN_MODEL_DIR", "/mnt/models")
 api_key = os.getenv("API_KEY")  # Optional: if not set, authentication is disabled
 require_auth = api_key is not None
 model_loaded = False
+# DEVICE_MAP: supports 'balanced' or 'cuda' (defaults to 'cuda')
+device_map = os.getenv("DEVICE_MAP", "cuda").strip().lower()
+if device_map not in ("balanced", "cuda"):
+    logger.warning(f"Unsupported DEVICE_MAP='{device_map}', falling back to 'cuda'")
+    device_map = "cuda"
 
 app = FastAPI(title="Qwen Image Edit API", version="1.0.0")
 
@@ -61,7 +70,8 @@ try:
         model_dir,
         torch_dtype=torch.float16,
         local_files_only=True,
-    ).to("cuda")
+        device_map=device_map,
+    )
     model_loaded = True
     logger.info("Model loaded successfully")
 except Exception as e:
