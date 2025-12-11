@@ -22,9 +22,7 @@ RUN python3 -m pip install --no-cache-dir --prefer-binary \
 # Copy application files
 COPY image_edit_server.py /app/
 COPY main.py /app/
-COPY entrypoint.sh /app/
 WORKDIR /app
-RUN chmod +x /app/entrypoint.sh
 
 # Health check (uses PORT env) — increase start period to allow model warm-up
 ENV PORT=8000
@@ -32,4 +30,4 @@ ENV PORT=8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
     CMD python3 -c "import requests, os; p=os.getenv('PORT','8000'); requests.get(f'http://localhost:{p}/health')" || exit 1
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python3", "main.py"]
