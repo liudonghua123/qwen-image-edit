@@ -11,23 +11,13 @@ RUN apt update && apt install -y \
     libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pyproject and install dependencies via pip (PEP 517)
-## Install runtime dependencies directly to avoid invoking build backends
-# (Installing the project via PEP 517 triggers flit/setuptools; for Docker
-# builds we prefer to install explicit runtime dependencies.)
-# Copy project and use `uv` to sync dependencies from `pyproject.toml`
-
-# Copy project into a build directory (avoid using /tmp/project)
-COPY . /build/
-WORKDIR /build
-
-# Upgrade pip and install `uv` (project sync tool) so we can run `uv sync`
+# Upgrade pip and install runtime dependencies via pip (global site-packages)
+# We explicitly list runtime deps to avoid invoking build backends for the
+# local package during the Docker build.
 RUN python3 -m pip install --upgrade pip setuptools wheel
-RUN python3 -m pip install --no-cache-dir uv
-
-# Use uv to sync/install declared runtime dependencies from pyproject.toml
-# `uv sync` will resolve and install wheels; using it avoids manual pip lists
-RUN uv sync || (echo "uv sync failed" && exit 1)
+RUN python3 -m pip install --no-cache-dir --prefer-binary \
+    fastapi uvicorn[standard] python-dotenv diffusers transformers accelerate \
+    Pillow python-multipart requests torch torchvision bitsandbytes
 
 # Copy application files
 COPY image_edit_server.py /app/
