@@ -4,6 +4,7 @@
 
 ## 功能特性
 
+- ✅ **批量处理**：支持单张或多张图像的批量处理
 - ✅ **OpenAI 兼容 API**：`/v1/images/edits` 端点与 OpenAI 接口兼容
 - ✅ **健康检查端点**：支持 `/health` 和 `/ready` 用于容器编排
 - ✅ **可选 API 认证**：HTTP Basic Auth（可选，密码为 `API_KEY`）
@@ -29,13 +30,21 @@ API_KEY=your-secret-key                # API 密钥（可选，不设置则禁�
 ```
 
 你也可以设置 `DEVICE_MAP`（可选）：
-- `cuda`：将模型放在单个 CUDA 设备上（默认）
-- `balanced`：让库在可用设备间平衡模型层
+- `balanced`：将模型层分散在多个 GPU 上（**推荐用于多 GPU 环境**）
+- `cuda`：将模型放在单个 GPU 上（仅用于单 GPU 环境）
+
+**⚠️ 重要提示**：如果有多张 GPU（2 张或更多）：
+- **必须** 使用 `DEVICE_MAP=balanced`
+- 使用 `DEVICE_MAP=cuda` 会导致只使用一张卡，其他卡闲置，容易 OOM
 
 例如：
 
 ```bash
+# 单张 GPU
 DEVICE_MAP=cuda
+
+# 双张或多张 GPU（推荐）
+DEVICE_MAP=balanced
 ```
 
 **注意**：`API_KEY` 是可选的：
@@ -50,19 +59,29 @@ DEVICE_MAP=cuda
 docker build -t liudonghua123/qwen-image-edit .
 ```
 
-运行容器：
+运行容器（推荐多 GPU 配置）：
 
 ```bash
-# 无认证模式（推荐用于开发）
+# 无认证模式，单 GPU
 docker run --gpus all \
   -e QWEN_MODEL_DIR=/mnt/models \
+  -e DEVICE_MAP=cuda \
   -v /path/to/models:/mnt/models \
   -p 8000:8000 \
   liudonghua123/qwen-image-edit
 
-# 启用认证模式（推荐用于生产）
+# 无认证模式，多 GPU（推荐）
 docker run --gpus all \
   -e QWEN_MODEL_DIR=/mnt/models \
+  -e DEVICE_MAP=balanced \
+  -v /path/to/models:/mnt/models \
+  -p 8000:8000 \
+  liudonghua123/qwen-image-edit
+
+# 启用认证模式，多 GPU
+docker run --gpus all \
+  -e QWEN_MODEL_DIR=/mnt/models \
+  -e DEVICE_MAP=balanced \
   -e API_KEY=your-secret-key \
   -v /path/to/models:/mnt/models \
   -p 8000:8000 \
@@ -152,31 +171,47 @@ python main.py
 curl -X POST "http://localhost:8000/v1/images/edits" \
   -u "user:your-secret-key" \
   -F "prompt=a beautiful landscape" \
-  -F "image=@image.jpg" \
+  -F "images=@image.jpg" \
   -F "n=1"
 ```
 
 **请求体** (multipart/form-data):
 - `prompt` (string, 必需): 编辑描述
-- `image` (file, 必需): 原始图像文件
-- `mask` (file, 可选): 掩码图像文件
+- `images` (files, 必需): 一个或多个原始图像文件（支持批处理）
 - `size` (string, 可选): 输出大小，默认 "1024x1024"
-- `n` (integer, 可选): 生成数量，默认 1，范围 1-10
+- `n` (integer, 可选): 每张输入图像生成的变体数，默认 1，范围 1-10
+- `negative_prompt` (string, 可选): 负面提示文本
+- `num_inference_steps` (integer, 可选): 推理步数，默认 50
+- `guidance_scale` (float, 可选): 引导尺度
 
 **示例请求**:
 
 ```bash
-# 无认证模式
+# 单张图像编辑
 curl -X POST "http://localhost:8000/v1/images/edits" \
   -F "prompt=a beautiful landscape" \
-  -F "image=@image.jpg" \
+  -F "images=@image.jpg" \
   -F "n=1"
+
+# 批量处理多张图像（一次 pipeline 调用处理所有图像）
+curl -X POST "http://localhost:8000/v1/images/edits" \
+  -F "prompt=enhance colors" \
+  -F "images=@photo1.jpg" \
+  -F "images=@photo2.jpg" \
+  -F "images=@photo3.jpg" \
+  -F "n=2"
+```
+说明：上面的批量请求会处理 3 张图像，每张生成 2 个变体，总共产生 6 张输出。
+  -F "images=@photo1.jpg" \
+  -F "images=@photo2.jpg" \
+  -F "images=@photo3.jpg" \
+  -F "n=2"
 
 # 启用认证模式
 curl -X POST "http://localhost:8000/v1/images/edits" \
-  -H "Authorization: Bearer your-api-key" \
+  -H "Authorization: Basic $(echo -n 'user:your-secret-key' | base64)" \
   -F "prompt=a beautiful landscape" \
-  -F "image=@image.jpg" \
+  -F "images=@image.jpg" \
   -F "n=1"
 ```
 
@@ -190,7 +225,9 @@ curl -X POST "http://localhost:8000/v1/images/edits" \
     }
   ],
   "usage": {
-    "processing_time_seconds": 12.34
+    "processing_time_seconds": 12.34,
+    "input_images": 2,
+    "generated_images": 4
   }
 }
 ```
@@ -242,40 +279,46 @@ import io
 API_URL = "http://localhost:8000/v1/images/edits"
 API_KEY = None  # 不需要认证时设为 None
 
-def edit_image(prompt, image_path, mask_path=None):
+def edit_images(image_paths, prompt, n=1):
+    """编辑一张或多张图像"""
     headers = {}
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
     
-    files = {
-        'prompt': (None, prompt),
-        'n': (None, '1'),
+    files = []
+    for image_path in image_paths:
+        with open(image_path, 'rb') as f:
+            files.append(('images', (image_path, f.read(), 'image/jpeg')))
+    
+    data = {
+        'prompt': prompt,
+        'n': n,
     }
     
-    with open(image_path, 'rb') as f:
-        files['image'] = ('image.jpg', f, 'image/jpeg')
-        
-        if mask_path:
-            with open(mask_path, 'rb') as m:
-                files['mask'] = ('mask.jpg', m, 'image/jpeg')
-                response = requests.post(API_URL, headers=headers, files=files)
-        else:
-            response = requests.post(API_URL, headers=headers, files=files)
+    response = requests.post(API_URL, headers=headers, files=files, data=data)
     
     if response.status_code == 200:
         result = response.json()
-        b64_image = result['data'][0]['b64_json']
-        image_bytes = base64.b64decode(b64_image)
-        return Image.open(io.BytesIO(image_bytes))
+        for idx, item in enumerate(result['data']):
+            b64_image = item['b64_json']
+            image_bytes = base64.b64decode(b64_image)
+            img = Image.open(io.BytesIO(image_bytes))
+            img.save(f"output_{idx}.jpg")
+        
+        print(f"输入: {result['usage']['input_images']} 张图像")
+        print(f"输出: {result['usage']['generated_images']} 张图像")
+        return result['data']
     else:
         print(f"Error: {response.status_code}")
         print(response.json())
         return None
 
 # 使用示例
-image = edit_image("add a red flower", "input.jpg")
-if image:
-    image.save("output.jpg")
+# 单张图像
+edit_images(["input.jpg"], "add a red flower")
+
+# 多张图像
+edit_images(["photo1.jpg", "photo2.jpg"], "enhance colors", n=2)
 ```
 
 ## 监控

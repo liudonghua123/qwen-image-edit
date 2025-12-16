@@ -4,7 +4,8 @@ import time
 import logging
 import secrets # <-- ADDED: For secure credential comparison
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, Form, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 # --- FIX: Changed from HTTPBearer/HTTPAuthCredentials to HTTPBasic/HTTPBasicCredentials ---
 from fastapi.security import HTTPBasic, HTTPBasicCredentials 
@@ -13,6 +14,7 @@ from PIL import Image
 import torch
 import os
 from dotenv import load_dotenv
+from torchvision.transforms import ToPILImage
 
 # Setup logging
 logging.basicConfig(
@@ -28,11 +30,13 @@ model_dir = os.getenv("QWEN_MODEL_DIR", "/mnt/models")
 api_key = os.getenv("API_KEY")  # Optional: if not set, authentication is disabled
 require_auth = api_key is not None
 model_loaded = False
-# DEVICE_MAP: supports 'balanced' or 'cuda' (defaults to 'cuda')
-device_map = os.getenv("DEVICE_MAP", "cuda").strip().lower()
+# DEVICE_MAP: supports 'balanced' or 'cuda' (defaults to 'balanced' for better multi-GPU support)
+# - 'cuda': places entire model on a single GPU (can cause OOM on large models with multiple GPUs)
+# - 'balanced': distributes model layers across available GPUs (recommended for multi-GPU setups)
+device_map = os.getenv("DEVICE_MAP", "balanced").strip().lower()
 if device_map not in ("balanced", "cuda"):
-    logger.warning(f"Unsupported DEVICE_MAP='{device_map}', falling back to 'cuda'")
-    device_map = "cuda"
+    logger.warning(f"Unsupported DEVICE_MAP='{device_map}', falling back to 'balanced'")
+    device_map = "balanced"
 
 app = FastAPI(title="Qwen Image Edit API", version="1.0.0")
 
@@ -155,18 +159,44 @@ async def readiness_check():
 @app.post("/v1/images/edits")
 async def image_edit(
     prompt: str = Form(...),
-    image: UploadFile = None,
-    mask: UploadFile = None,
+    images: List[UploadFile] = File(...),
+    negative_prompt: str = Form(default=None),
     size: str = Form("1024x1024"),
     n: int = Form(1),
+    num_inference_steps: int = Form(50),
+    guidance_scale: float = Form(None),
+    true_cfg_scale: float = Form(4.0),
+    output_type: str = Form("pil"),
+    max_sequence_length: int = Form(512),
     # --- FIX: Changed dependency type hint to HTTPBasicCredentials ---
     credentials: HTTPBasicCredentials = Depends(security), 
 ):
     """
-    Edit an image using Qwen Image Edit model.
+    Edit image(s) using Qwen Image Edit model.
+    
+    Supports single or multiple input images. Pipeline will process them together
+    for batch editing or generate variations for each image.
+    
+    Parameters:
+    - prompt (str, required): The text prompt for image editing
+    - images (List[file], required): One or more input image files
+    - negative_prompt (str, optional): Text describing what should NOT appear
+    - size (str): Image size in format "WIDTHxHEIGHT" (default: "1024x1024")
+    - n (int): Number of images to generate per input (default: 1, max: 10)
+    - num_inference_steps (int): Number of denoising steps (default: 50)
+    - guidance_scale (float, optional): How much to follow the prompt
+    - true_cfg_scale (float): Classifier-free guidance scale (default: 4.0)
+    - output_type (str): Output format, "pil" or "pt" (default: "pil")
+    - max_sequence_length (int): Maximum sequence length for tokenizer (default: 512)
     
     Authentication is optional (only required if API_KEY environment variable is set).
     Uses HTTP Basic Auth (Username: any, Password: API_KEY).
+    
+    Request example:
+        curl -X POST http://localhost:8000/v1/images/edits \\
+          -F "prompt=make the sky blue" \\
+          -F "images=@photo1.jpg" \\
+          -F "images=@photo2.jpg"
     """
     try:
         # Verify authentication (if required)
@@ -178,8 +208,8 @@ async def image_edit(
             raise ModelNotReadyError()
         
         # Validate inputs
-        if not image:
-            raise InvalidInputError("Image is required")
+        if not images or len(images) == 0:
+            raise InvalidInputError("At least one image is required")
         
         if not prompt or len(prompt.strip()) == 0:
             raise InvalidInputError("Prompt cannot be empty")
@@ -187,48 +217,109 @@ async def image_edit(
         if n < 1 or n > 10:
             raise InvalidInputError("n must be between 1 and 10")
         
-        # Validate image
+        if num_inference_steps < 1:
+            raise InvalidInputError("num_inference_steps must be at least 1")
+        
+        if output_type not in ("pil", "pt"):
+            raise InvalidInputError("output_type must be 'pil' or 'pt'")
+        
+        # Parse size parameter (format: "WIDTHxHEIGHT")
         try:
-            init_image = Image.open(io.BytesIO(await image.read())).convert("RGB")
-        except Exception as e:
-            raise InvalidInputError(f"Invalid image format: {str(e)}")
+            size_parts = size.split("x")
+            if len(size_parts) != 2:
+                raise ValueError()
+            width, height = int(size_parts[0]), int(size_parts[1])
+            if width <= 0 or height <= 0:
+                raise ValueError()
+        except (ValueError, IndexError):
+            raise InvalidInputError("Invalid size format. Use 'WIDTHxHEIGHT' (e.g., '1024x1024')")
         
-        # Validate mask if provided
-        mask_image = None
-        if mask:
+        # Load and validate all images
+        pil_images: List[Image.Image] = []
+        for idx, image_file in enumerate(images):
             try:
-                mask_image = Image.open(io.BytesIO(await mask.read())).convert("RGB")
+                img = Image.open(io.BytesIO(await image_file.read())).convert("RGB")
+                pil_images.append(img)
+                logger.debug(f"Loaded image {idx+1}/{len(images)}: {image_file.filename}")
             except Exception as e:
-                raise InvalidInputError(f"Invalid mask format: {str(e)}")
+                raise InvalidInputError(f"Invalid image format at index {idx}: {str(e)}")
         
-        logger.info(f"Processing image edit request: prompt='{prompt[:50]}...', n={n}")
+        logger.info(
+            f"Processing image edit request: "
+            f"num_images={len(pil_images)}, prompt='{prompt[:50]}...', "
+            f"size={size}, n={n}, num_inference_steps={num_inference_steps}"
+        )
         
         results = []
         start_time = time.time()
         
-        for i in range(n):
-            try:
-                out_img = pipe(
-                    prompt=prompt,
-                    image=init_image,
-                    mask_image=mask_image,
-                ).images[0]
-                
-                results.append({"b64_json": pil_to_b64(out_img)})
-                logger.debug(f"Generated image {i+1}/{n}")
-            except Exception as e:
-                logger.error(f"Error generating image {i+1}: {str(e)}")
-                raise APIError(f"Image generation failed: {str(e)}", "GENERATION_ERROR", 500)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Image edit completed in {elapsed_time:.2f}s, generated {n} image(s)")
+        try:
+            # Build pipeline call kwargs with all supported parameters
+            # Pass multiple images as a list to the pipeline for batch processing
+            pipe_kwargs = {
+                "prompt": prompt,
+                "image": pil_images if len(pil_images) > 1 else pil_images[0],  # Pass list if multiple, single image if one
+                "height": height,
+                "width": width,
+                "num_inference_steps": num_inference_steps,
+                "true_cfg_scale": true_cfg_scale,
+                "output_type": output_type,
+                "max_sequence_length": max_sequence_length,
+                "num_images_per_prompt": n,  # Generate n variations per input image
+            }
+            
+            # Add optional parameters if provided
+            if negative_prompt:
+                pipe_kwargs["negative_prompt"] = negative_prompt
+            
+            if guidance_scale is not None:
+                pipe_kwargs["guidance_scale"] = guidance_scale
+            
+            # Single pipeline call with all images and parameters
+            output = pipe(**pipe_kwargs)
+            
+            # Process all generated images
+            # output.images is a list of generated images
+            for idx, out_image in enumerate(output.images):
+                try:
+                    if output_type == "pil":
+                        results.append({"b64_json": pil_to_b64(out_image)})
+                    else:  # output_type == "pt"
+                        # For tensor output, convert to PIL first for consistent API response
+                        to_pil = ToPILImage()
+                        if isinstance(out_image, Image.Image):
+                            results.append({"b64_json": pil_to_b64(out_image)})
+                        else:
+                            # Handle tensor output
+                            tensor = out_image
+                            if tensor.dim() == 3 and tensor.shape[0] in (3, 4):  # (C, H, W)
+                                out_img = to_pil(tensor)
+                            else:
+                                out_img = to_pil(tensor.permute(2, 0, 1) / 255.0)  # Assuming (H, W, C)
+                            results.append({"b64_json": pil_to_b64(out_img)})
+                    logger.debug(f"Processed generated image {idx+1}/{len(output.images)}")
+                except Exception as e:
+                    logger.error(f"Error processing image {idx+1}: {str(e)}")
+                    raise
+            
+            elapsed_time = time.time() - start_time
+            total_generated = len(output.images)
+            logger.info(
+                f"Image edit completed in {elapsed_time:.2f}s, "
+                f"processed {len(pil_images)} image(s), generated {total_generated} result(s)"
+            )
+        except Exception as e:
+            logger.error(f"Error in image editing pipeline: {str(e)}")
+            raise APIError(f"Image generation failed: {str(e)}", "GENERATION_ERROR", 500)
         
         return JSONResponse(
             {
                 "created": int(time.time()),
                 "data": results,
                 "usage": {
-                    "processing_time_seconds": elapsed_time
+                    "processing_time_seconds": elapsed_time,
+                    "input_images": len(pil_images),
+                    "generated_images": total_generated,
                 }
             }
         )
